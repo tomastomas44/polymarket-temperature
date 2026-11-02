@@ -1,0 +1,49 @@
+name: snapshot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub may delay or skip runs under load
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Decide if this run also saves full ladders (first run of each UTC hour)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="data-$(date -u +%F)"
+          HOUR="$(date -u +%Y%m%dT%H)"
+          gh release view "$TAG" --json assets -q '.assets[].name' > assets.txt 2>/dev/null || : > assets.txt
+          if grep -q "^markets_${HOUR}" assets.txt; then echo "FULL=" >> "$GITHUB_ENV"; else echo "FULL=--full" >> "$GITHUB_ENV"; fi
+
+      - run: python gh_scraper.py snapshot --out out $FULL
+
+      - name: Upload to the day's release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for d in out/*/; do
+            t="$(basename "$d")"
+            gh release view "$t" >/dev/null 2>&1 || \
+              gh release create "$t" --title "$t" --notes "Polymarket temperature data, UTC day ${t#data-}" --latest=false || true
+            gh release upload "$t" "$d"* --clobber
+          done
