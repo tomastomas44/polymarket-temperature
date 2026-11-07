@@ -1,12 +1,16 @@
 name: snapshot
 
+# One long job takes a snapshot every 5 min for ~5h40, then starts the next job itself.
+# (GitHub only ran the old */5 cron a few times a day.) The cron below just restarts
+# the chain if it ever breaks.
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub may delay or skip runs under load
+    - cron: "7 */3 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
+  actions: write          # lets the job start the next one
 
 concurrency:
   group: snapshot
@@ -15,7 +19,7 @@ concurrency:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 355    # GitHub's hard limit is 360
     steps:
       - uses: actions/checkout@v4
 
@@ -26,24 +30,35 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Decide if this run also saves full ladders (first run of each UTC hour)
+      - name: Snapshot every 5 minutes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="data-$(date -u +%F)"
-          HOUR="$(date -u +%Y%m%dT%H)"
-          gh release view "$TAG" --json assets -q '.assets[].name' > assets.txt 2>/dev/null || : > assets.txt
-          if grep -q "^markets_${HOUR}" assets.txt; then echo "FULL=" >> "$GITHUB_ENV"; else echo "FULL=--full" >> "$GITHUB_ENV"; fi
-
-      - run: python gh_scraper.py snapshot --out out $FULL
-
-      - name: Upload to the day's release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for d in out/*/; do
-            t="$(basename "$d")"
-            gh release view "$t" >/dev/null 2>&1 || \
-              gh release create "$t" --title "$t" --notes "Polymarket temperature data, UTC day ${t#data-}" --latest=false || true
-            gh release upload "$t" "$d"* --clobber
+          end=$(( $(date +%s) + 340*60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            t0=$(date +%s)
+            TAG="data-$(date -u +%F)"
+            HOUR="$(date -u +%Y%m%dT%H)"
+            gh release view "$TAG" --json assets -q '.assets[].name' > assets.txt 2>/dev/null || : > assets.txt
+            if grep -q "^markets_${HOUR}" assets.txt; then FULL=""; else FULL="--full"; fi
+            rm -rf out
+            if python gh_scraper.py snapshot --out out $FULL; then
+              for d in out/*/; do
+                [ -d "$d" ] || continue
+                t="$(basename "$d")"
+                gh release view "$t" >/dev/null 2>&1 || \
+                  gh release create "$t" --title "$t" --notes "Polymarket temperature data, UTC day ${t#data-}" --latest=false || true
+                gh release upload "$t" "$d"* --clobber || echo "warn: upload failed"
+              done
+            else
+              echo "warn: snapshot failed, retrying next cycle"
+            fi
+            left=$(( 300 - ($(date +%s) - t0) ))
+            [ "$left" -gt 0 ] && sleep "$left"
           done
+
+      - name: Start the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run snapshot.yml --ref "${{ github.ref_name }}"
